@@ -2,7 +2,7 @@
 # Samsung Electronics TOUCH driver configuration
 #
 
-config TOUCHSCREEN_SEC_TS
+config TOUCHSCREEN_SEC_TS_Y771
         tristate "Samsung Electronics Touchscreen"
         depends on I2C
         help

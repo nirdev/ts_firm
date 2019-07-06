@@ -63,8 +63,6 @@ static int sec_ts_enter_fw_mode(struct sec_ts_data *ts)
 	ts->boot_ver[2] = id[2];
 
 	ts->flash_page_size = SEC_TS_FW_BLK_SIZE_DEFAULT;
-	if ((ts->boot_ver[1] == 0x37) && (ts->boot_ver[2] == 0x61))
-		ts->flash_page_size = 512;
 
 	input_info(true, &ts->client->dev, "%s: read_boot_id = %02X%02X%02X\n", __func__, id[0], id[1], id[2]);
 
@@ -189,7 +187,7 @@ static int sec_ts_save_version_of_ic(struct sec_ts_data *ts)
 	return 1;
 }
 
-static int sec_ts_check_firmware_version(struct sec_ts_data *ts, const u8 *fw_info)
+int sec_ts_check_firmware_version(struct sec_ts_data *ts, const u8 *fw_info)
 {
 	fw_header *fw_hd;
 	u8 buff[1];
@@ -229,8 +227,9 @@ static int sec_ts_check_firmware_version(struct sec_ts_data *ts, const u8 *fw_in
 	/* check f/w version
 	 * ver[0] : IC version
 	 * ver[1] : Project version
+	 * ver[2] : Panel infomation
 	 */
-	for (i = 0; i < 2; i++) {
+	for (i = 0; i < 3; i++) {
 		if (ts->plat_data->img_version_of_ic[i] != ts->plat_data->img_version_of_bin[i]) {
 			if (ts->plat_data->bringup == 3) {
 				input_err(true, &ts->client->dev, "%s: bringup. force update\n", __func__);
@@ -241,10 +240,8 @@ static int sec_ts_check_firmware_version(struct sec_ts_data *ts, const u8 *fw_in
 		}
 	}
 
-	for (i = 2; i < 4; i++) {
-		if (ts->plat_data->img_version_of_ic[i] < ts->plat_data->img_version_of_bin[i])
-			return 1;
-	}
+	if (ts->plat_data->img_version_of_ic[3] < ts->plat_data->img_version_of_bin[3])
+		return 1;
 
 	return 0;
 }
@@ -339,7 +336,6 @@ err_write:
 	input_err(true, &ts->client->dev,
 			"%s: failed to alloc.\n", __func__);
 	return -ENOMEM;
-
 }
 
 static int sec_ts_flashwrite(struct sec_ts_data *ts, u32 mem_addr, u8 *mem_data, u32 mem_size, int retry)
@@ -409,7 +405,6 @@ static int sec_ts_flashwrite(struct sec_ts_data *ts, u32 mem_addr, u8 *mem_data,
 					goto err;
 				}
 			}
-
 		}
 
 		size_copy = flash_page_size;
@@ -420,6 +415,7 @@ static int sec_ts_flashwrite(struct sec_ts_data *ts, u32 mem_addr, u8 *mem_data,
 	}
 
 	return mem_size;
+
 err:
 	return -EIO;
 }
@@ -573,7 +569,7 @@ err_write_fail:
 }
 
 static int sec_ts_firmware_update(struct sec_ts_data *ts, const u8 *data,
-		size_t size, int bl_update, int boot, int retry)
+						size_t size, int bl_update, int retry)
 {
 	int i;
 	int ret;
@@ -629,23 +625,6 @@ static int sec_ts_firmware_update(struct sec_ts_data *ts, const u8 *data,
 
 	sec_ts_sw_reset(ts);
 
-#ifdef PAT_CONTROL
-	sec_ts_tclm(ts, boot, false);
-#else
-	/* always calibration after fw update */
-	input_err(true, &ts->client->dev, "%s: RUN OFFSET CALIBRATION\n", __func__);
-
-	ret = sec_ts_execute_force_calibration(ts, OFFSET_CAL_SEC);
-	if (ret < 0)
-		input_err(true, &ts->client->dev, "%s: fail to write OFFSET CAL SEC!\n", __func__);
-
-#ifdef USE_PRESSURE_SENSOR
-	ret = sec_ts_execute_force_calibration(ts, PRESSURE_CAL);
-	if (ret < 0)
-		input_err(true, &ts->client->dev, "%s: fail to write PRESSURE CAL!\n", __func__);
-#endif
-#endif
-
 	if (!bl_update) {
 		/* Sense_on */
 		ret = ts->sec_ts_i2c_write(ts, SEC_TS_CMD_SENSE_ON, NULL, 0);
@@ -682,36 +661,6 @@ static int sec_ts_firmware_update(struct sec_ts_data *ts, const u8 *data,
 			return -EIO;
 		}
 	}
-
-}
-
-int sec_ts_firmware_update_bl(struct sec_ts_data *ts)
-{
-	const struct firmware *fw_entry;
-	char fw_path[SEC_TS_MAX_FW_PATH];
-	int result = -1;
-
-	disable_irq(ts->client->irq);
-
-	snprintf(fw_path, SEC_TS_MAX_FW_PATH, "%s", SEC_TS_DEFAULT_BL_NAME);
-
-	input_info(true, &ts->client->dev, "%s: initial bl update %s\n", __func__, fw_path);
-
-	/* Loading Firmware------------------------------------------ */
-	if (request_firmware(&fw_entry, fw_path, &ts->client->dev) !=  0) {
-		input_err(true, &ts->client->dev, "%s: bt is not available\n", __func__);
-		goto err_request_fw;
-	}
-	input_info(true, &ts->client->dev, "%s: request bt done! size = %d\n", __func__, (int)fw_entry->size);
-
-	/* pat_control - boot(false) */
-	result = sec_ts_firmware_update(ts, fw_entry->data, fw_entry->size, 1, false, 0);
-
-err_request_fw:
-	release_firmware(fw_entry);
-	enable_irq(ts->client->irq);
-
-	return result;
 }
 
 int sec_ts_bl_update(struct sec_ts_data *ts)
@@ -756,6 +705,7 @@ int sec_ts_bl_update(struct sec_ts_data *ts)
 	}
 
 	return ret;
+
 err:
 	return -EIO;
 }
@@ -767,6 +717,17 @@ int sec_ts_firmware_update_on_probe(struct sec_ts_data *ts, bool force_update)
 	int result = -1;
 	int ii = 0;
 	int ret = 0;
+
+#ifdef TCLM_CONCEPT
+	int retry = 3;
+	int restore_cal = 0;
+	if (ts->tdata->support_tclm_test) {
+		ret = sec_tclm_test_on_probe(ts->tdata);
+		if (ret < 0)
+			input_info(true, &ts->client->dev, "%s: SEC_TCLM_NVM_ALL_DATA i2c read fail", __func__);
+
+	}
+#endif
 
 	if (ts->plat_data->bringup == 1) {
 		input_err(true, &ts->client->dev, "%s: bringup. do not update\n", __func__);
@@ -794,32 +755,74 @@ int sec_ts_firmware_update_on_probe(struct sec_ts_data *ts, bool force_update)
 	input_info(true, &ts->client->dev, "%s: request firmware done! size = %d\n", __func__, (int)fw_entry->size);
 
 	result = sec_ts_check_firmware_version(ts, fw_entry->data);
-
 	if (ts->plat_data->bringup == 2) {
 		input_err(true, &ts->client->dev, "%s: bringup. do not update\n", __func__);
 		result = 0;
 		goto err_request_fw;
 	}
 
-	/* ic fw ver > bin fw ver && force is false*/
+	/* don't firmup case */
 	if ((result <= 0) && (!force_update)) {
-		/* clear nv,  forced f/w update eventhough same f/w,  then apply pat magic */
-		if (ts->plat_data->pat_function == PAT_CONTROL_FORCE_UPDATE) {
-			input_info(true, &ts->client->dev, "%s: run forced f/w update and excute autotune\n", __func__);
-		} else {
-			input_info(true, &ts->client->dev, "%s: skip - fw update & nv read\n", __func__);
+		input_info(true, &ts->client->dev, "%s: skip - fw update\n", __func__);
+		goto err_request_fw;
+	} else {	/* firmup case */
+
+		for (ii = 0; ii < 3; ii++) {
+			ret = sec_ts_firmware_update(ts, fw_entry->data, fw_entry->size, 0, ii);
+			if (ret >= 0)
+				break;
+		}
+
+		if (ret < 0) {
+			result = -1;
 			goto err_request_fw;
 		}
+
+		sec_ts_save_version_of_ic(ts);
+
+		result = 0;
+
+#ifdef TCLM_CONCEPT
+		while (retry--) {
+			ret = ts->tdata->tclm_read(ts->tdata->client, SEC_TCLM_NVM_ALL_DATA);
+			if (ret >= 0)
+				break;
+		}
+
+		if (ret < 0) {
+			input_info(true, &ts->client->dev, "%s: SEC_TCLM_NVM_ALL_DATA i2c read fail", __func__);
+			goto err_request_fw;
+		}
+
+		input_info(true, &ts->client->dev, "%s: tune_fix_ver [%04X] afe_base [%04X]\n",
+			__func__, ts->tdata->nvdata.tune_fix_ver, ts->tdata->afe_base);
+
+		if ((ts->tdata->tclm_level > TCLM_LEVEL_CLEAR_NV) &&
+			((ts->tdata->nvdata.tune_fix_ver == 0xffff)
+			|| (ts->tdata->afe_base > ts->tdata->nvdata.tune_fix_ver))) {
+			/* tune version up case */
+			sec_tclm_root_of_cal(ts->tdata, CALPOSITION_TUNEUP);
+			restore_cal = 1;
+		} else if (ts->tdata->tclm_level == TCLM_LEVEL_CLEAR_NV) {
+			/* firmup case */
+			sec_tclm_root_of_cal(ts->tdata, CALPOSITION_FIRMUP);
+			restore_cal = 1;
+		}
+
+		if (restore_cal == 1) {
+			input_err(true, &ts->client->dev, "%s: RUN OFFSET CALIBRATION\n", __func__);
+			ret = sec_execute_tclm_package(ts->tdata, 0);
+			if (ret < 0) {
+				input_err(true, &ts->client->dev, "%s: sec_execute_tclm_package fail\n", __func__);
+			}
+		}
+#endif
 	}
 
-	for (ii = 0; ii < 3; ii++) {
-		/* pat_control - boot(true) */
-		ret = sec_ts_firmware_update(ts, fw_entry->data, fw_entry->size, 0, true, ii);
-		if (ret >= 0)
-			break;
-	}
 
-	sec_ts_save_version_of_ic(ts);
+#ifdef TCLM_CONCEPT
+	sec_tclm_root_of_cal(ts->tdata, CALPOSITION_NONE);
+#endif
 
 err_request_fw:
 	release_firmware(fw_entry);
@@ -832,6 +835,14 @@ static int sec_ts_load_fw_from_bin(struct sec_ts_data *ts)
 	const struct firmware *fw_entry;
 	char fw_path[SEC_TS_MAX_FW_PATH];
 	int error = 0;
+	int restore_cal = 0;
+
+	if (ts->plat_data->bringup == 1) {
+		error = -1;
+		input_info(true, &ts->client->dev, "%s: can't update for bringup:%d\n",
+				__func__, ts->plat_data->bringup);
+		return error;
+	}
 
 	if (ts->client->irq)
 		disable_irq(ts->client->irq);
@@ -851,11 +862,22 @@ static int sec_ts_load_fw_from_bin(struct sec_ts_data *ts)
 	}
 	input_info(true, &ts->client->dev, "%s: request firmware done! size = %d\n", __func__, (int)fw_entry->size);
 
-	/* pat_control - boot(false) */
-	if (sec_ts_firmware_update(ts, fw_entry->data, fw_entry->size, 0, false, 0) < 0)
+#ifdef TCLM_CONCEPT
+	sec_tclm_root_of_cal(ts->tdata, CALPOSITION_TESTMODE);
+	restore_cal = 1;
+#endif
+	/* use virtual tclm_control - magic cal 1 */
+	if (sec_ts_firmware_update(ts, fw_entry->data, fw_entry->size, 0, 0) < 0) {
 		error = -1;
-	else
-		error = 0;
+		restore_cal = 0;
+	}
+
+#ifdef TCLM_CONCEPT
+	if (restore_cal == 1) {
+		sec_execute_tclm_package(ts->tdata, 0);
+	}
+	sec_tclm_root_of_cal(ts->tdata, CALPOSITION_NONE);
+#endif
 
 	sec_ts_save_version_of_ic(ts);
 
@@ -874,7 +896,9 @@ static int sec_ts_load_fw_from_ums(struct sec_ts_data *ts)
 	mm_segment_t old_fs;
 	long fw_size, nread;
 	int error = 0;
-
+#ifdef TCLM_CONCEPT
+	int restore_cal = 0;
+#endif
 	old_fs = get_fs();
 	set_fs(KERNEL_DS);
 
@@ -920,18 +944,32 @@ static int sec_ts_load_fw_from_ums(struct sec_ts_data *ts)
 
 			if (ts->client->irq)
 				disable_irq(ts->client->irq);
-			/* pat_control - boot(false) */
-			if (sec_ts_firmware_update(ts, fw_data, fw_size, 0, false, 0) >= 0)
-				sec_ts_save_version_of_ic(ts);
 
-			if (ts->client->irq)
-				enable_irq(ts->client->irq);
+#ifdef TCLM_CONCEPT
+			sec_tclm_root_of_cal(ts->tdata, CALPOSITION_TESTMODE);
+			restore_cal = 1;
+#endif
+			/* use virtual tclm_control - magic cal 1 */
+			if (sec_ts_firmware_update(ts, fw_data, fw_size, 0, 0) < 0) {
+				error = -1; /* firmware failed */
+				goto done;
+			}
+
+			sec_ts_save_version_of_ic(ts);
 		}
 
-		if (error < 0)
-			input_err(true, ts->dev, "%s: failed update firmware\n",
-					__func__);
-
+#ifdef TCLM_CONCEPT
+		sec_execute_tclm_package(ts->tdata, 0);
+#endif
+done:
+	if (error < 0)
+		input_err(true, ts->dev, "%s: failed update firmware\n",
+				__func__);
+#ifdef TCLM_CONCEPT
+		sec_tclm_root_of_cal(ts->tdata, CALPOSITION_NONE);
+#endif
+		if (ts->client->irq)
+			enable_irq(ts->client->irq);
 		vfree(fw_data);
 	}
 
@@ -940,38 +978,6 @@ static int sec_ts_load_fw_from_ums(struct sec_ts_data *ts)
 open_err:
 	set_fs(old_fs);
 	return error;
-}
-
-static int sec_ts_load_fw_from_ffu(struct sec_ts_data *ts)
-{
-	const struct firmware *fw_entry;
-	const char *fw_path = SEC_TS_DEFAULT_FFU_FW;
-	int result = -1;
-
-	disable_irq(ts->client->irq);
-
-	input_info(true, ts->dev, "%s: Load firmware : %s\n", __func__, fw_path);
-
-	/* Loading Firmware */
-	if (request_firmware(&fw_entry, fw_path, &ts->client->dev) !=  0) {
-		input_err(true, &ts->client->dev, "%s: firmware is not available\n", __func__);
-		goto err_request_fw;
-	}
-	input_info(true, &ts->client->dev, "%s: request firmware done! size = %d\n", __func__, (int)fw_entry->size);
-
-	sec_ts_check_firmware_version(ts, fw_entry->data);
-	/* pat_control - boot(false) */
-	if (sec_ts_firmware_update(ts, fw_entry->data, fw_entry->size, 0, false, 0) < 0)
-		result = -1;
-	else
-		result = 0;
-
-	sec_ts_save_version_of_ic(ts);
-
-err_request_fw:
-	release_firmware(fw_entry);
-	enable_irq(ts->client->irq);
-	return result;
 }
 
 int sec_ts_firmware_update_on_hidden_menu(struct sec_ts_data *ts, int update_type)
@@ -994,36 +1000,13 @@ int sec_ts_firmware_update_on_hidden_menu(struct sec_ts_data *ts, int update_typ
 	case UMS:
 		ret = sec_ts_load_fw_from_ums(ts);
 		break;
-	case FFU:
-		ret = sec_ts_load_fw_from_ffu(ts);
-		break;
-	case BL:
-		ret = sec_ts_firmware_update_bl(ts);
-		if (ret < 0) {
-			break;
-		} else if (!ret) {
-			ret = sec_ts_firmware_update_on_probe(ts, false);
-			break;
-		} else {
-			ret = sec_ts_bl_update(ts);
-			if (ret < 0)
-				break;
-			ret = sec_ts_firmware_update_on_probe(ts, false);
-			if (ret < 0)
-				break;
-		}
-		break;
 	default:
 		input_err(true, ts->dev, "%s: Not support command[%d]\n",
 				__func__, update_type);
 		break;
 	}
 
-#ifdef SEC_TS_SUPPORT_SPONGELIB
 	sec_ts_check_custom_library(ts);
-	if (ts->use_sponge)
-		sec_ts_set_custom_library(ts);
-#endif
 
 	return ret;
 }
